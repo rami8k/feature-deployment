@@ -1,0 +1,108 @@
+variables:
+  DEPLOY_IMAGE: $DOCKER_HOST/terraform:latest
+
+stages:
+  - deploy
+  - destroy
+
+before_script:
+  - POSTFIX=$(if [ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]; then echo ""; else echo "$CI_COMMIT_BRANCH" | grep -Eo "\b[A-Z]+-[0-9]+"; fi)
+  - TF_POSTFIX=$(if [ "${CI_COMMIT_BRANCH}" == "${CI_DEFAULT_BRANCH}" ]; then echo ""; else echo "-${POSTFIX}" | tr "[:upper:]" "[:lower:]"; fi)
+
+.branch:
+  environment:
+    name: development
+    deployment_tier: development
+  variables:
+    POSTFIX: $TF_POSTFIX
+    ACCOUNT_NUMBER: 1111
+  rules:
+    - if: $CI_COMMIT_BRANCH != $CI_DEFAULT_BRANCH && $POSTFIX != ""
+      allow_failure: false
+
+.test:
+  environment:
+    name: test
+    deployment_tier: testing
+  resource_group: test
+  variables:
+    ACCOUNT_NUMBER: 2222
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.prd:
+  environment:
+    name: prd
+    deployment_tier: production
+  resource_group: prd
+  variables:
+    ACCOUNT_NUMBER: 3333
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+.deploy:
+  image: $DEPLOY_IMAGE
+  stage: deploy
+  script:
+    - export TF_VAR_postfix=$TF_POSTFIX
+    - terraform -chdir=tf init -backend-config=../tf_env/$CI_ENVIRONMENT_NAME-backend.tfvars
+    - ([ "${POSTFIX}" != "" ] && terraform -chdir=tf workspace select -or-create "${POSTFIX}"; echo $?)
+    - terraform -chdir=tf apply -auto-approve -var-file=../tf_env/$CI_ENVIRONMENT_NAME.tfvars
+  artifacts:
+    untracked: true
+
+.destroy:
+  image: $DEPLOY_IMAGE
+  stage: destroy
+  script:
+    - terraform -chdir=tf init -backend-config=../tf_env/$CI_ENVIRONMENT_NAME-backend.tfvars
+    - ([ "${POSTFIX}" != "" ] && terraform -chdir=tf workspace select -or-create "${POSTFIX}"; echo $?)
+    - terraform -chdir=tf destroy -auto-approve -var-file=../tf_env/$CI_ENVIRONMENT_NAME.tfvars
+  when: manual
+  needs: []
+
+deploy branch:
+  extends:
+    - .branch
+    - .deploy
+  environment:
+    on_stop: destroy branch
+    auto_stop_in: 1 week
+  needs:
+    - build
+
+destroy branch:
+  extends:
+    - .branch
+    - .destroy
+  environment:
+    action: stop
+
+deploy test:
+  extends:
+    - .test
+    - .deploy
+  when: manual
+
+destroy test:
+  extends:
+    - .test
+    - .destroy
+  needs:
+    - job: deploy test
+      artifacts: false
+
+deploy prd:
+  extends:
+    - .prd
+    - .deploy
+  when: manual
+
+destroy prd:
+  extends:
+    - .prd
+    - .destroy
+  needs:
+    - job: deploy prd
+      artifacts: false
+  when: on_failure
